@@ -332,6 +332,10 @@ pub struct TelegramChannel {
     transcription: Option<crate::config::TranscriptionConfig>,
     voice_transcriptions: Mutex<std::collections::HashMap<String, String>>,
     workspace_dir: Option<std::path::PathBuf>,
+    /// Text-to-speech config for outgoing voice replies.
+    tts_config: Option<crate::config::TtsConfig>,
+    /// reply_targets whose last inbound message was a voice note.
+    voice_chats: Mutex<std::collections::HashSet<String>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -370,6 +374,8 @@ impl TelegramChannel {
             transcription: None,
             voice_transcriptions: Mutex::new(std::collections::HashMap::new()),
             workspace_dir: None,
+            tts_config: None,
+            voice_chats: Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -401,6 +407,14 @@ impl TelegramChannel {
     pub fn with_transcription(mut self, config: crate::config::TranscriptionConfig) -> Self {
         if config.enabled {
             self.transcription = Some(config);
+        }
+        self
+    }
+
+    /// Configure text-to-speech for outgoing voice replies.
+    pub fn with_tts(mut self, config: crate::config::TtsConfig) -> Self {
+        if config.enabled {
+            self.tts_config = Some(config);
         }
         self
     }
@@ -1174,6 +1188,13 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             cache.insert(format!("{chat_id}:{message_id}"), text.clone());
         }
 
+        // Mark this chat as a voice chat so the response is also sent as audio
+        // (inbound TTS mode: reply in kind when the user sends a voice message).
+        {
+            let mut vc = self.voice_chats.lock();
+            vc.insert(reply_target.clone());
+        }
+
         let content = if let Some(quote) = self.extract_reply_context(message) {
             format!("{quote}\n\n[Voice] {text}")
         } else {
@@ -1321,6 +1342,13 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         } else {
             chat_id.clone()
         };
+
+        // A text message clears the voice-chat flag so subsequent replies are
+        // text-only (inbound TTS mode resets when the user switches to text).
+        {
+            let mut vc = self.voice_chats.lock();
+            vc.remove(&reply_target);
+        }
 
         let content = if self.mention_only && is_group {
             let bot_username = self.bot_username.lock();
@@ -2064,6 +2092,45 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         Ok(())
     }
 
+    /// Send a voice message from in-memory bytes to a Telegram chat.
+    pub async fn send_voice_bytes(
+        &self,
+        chat_id: &str,
+        thread_id: Option<&str>,
+        audio_bytes: Vec<u8>,
+        file_name: &str,
+        caption: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let part = Part::bytes(audio_bytes).file_name(file_name.to_string());
+
+        let mut form = Form::new()
+            .text("chat_id", chat_id.to_string())
+            .part("voice", part);
+
+        if let Some(tid) = thread_id {
+            form = form.text("message_thread_id", tid.to_string());
+        }
+
+        if let Some(cap) = caption {
+            form = form.text("caption", cap.to_string());
+        }
+
+        let resp = self
+            .http_client()
+            .post(self.api_url("sendVoice"))
+            .multipart(form)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let err = resp.text().await?;
+            anyhow::bail!("Telegram sendVoice failed: {err}");
+        }
+
+        tracing::info!("Telegram voice (bytes) sent to {chat_id}: {file_name}");
+        Ok(())
+    }
+
     /// Send a file by URL (Telegram will download it)
     pub async fn send_document_by_url(
         &self,
@@ -2172,6 +2239,22 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     ) -> anyhow::Result<()> {
         self.send_media_by_url("sendVoice", "voice", chat_id, thread_id, url, caption)
             .await
+    }
+
+    /// Minimum character count for a reply to be eligible for TTS synthesis.
+    const MIN_TTS_CONTENT_LEN: usize = 40;
+
+    /// Returns `true` when `text` is a substantive natural-language reply that
+    /// should be converted to speech.  Filters out tool outputs (URLs, JSON,
+    /// code blocks), error strings, and very short status messages.
+    fn is_substantive_for_tts(text: &str) -> bool {
+        text.len() > Self::MIN_TTS_CONTENT_LEN
+            && !text.starts_with("http")
+            && !text.starts_with('{')
+            && !text.starts_with('[')
+            && !text.starts_with("Error")
+            && !text.contains("```")
+            && !text.contains("tool_call")
     }
 }
 
@@ -2522,7 +2605,68 @@ impl Channel for TelegramChannel {
             return Ok(());
         }
 
-        self.send_text_chunks(&content, chat_id, thread_id).await
+        self.send_text_chunks(&content, chat_id, thread_id).await?;
+
+        // Inbound TTS mode: synthesise a voice reply when the user's last
+        // message was a voice note (inbound_only=true, the default) or always
+        // when inbound_only=false.  Only substantive natural-language replies
+        // are converted — tool outputs, URLs, JSON, code blocks, and error
+        // messages are skipped.
+        if let Some(ref tts_cfg) = self.tts_config {
+            let is_voice_chat = self.voice_chats.lock().contains(message.recipient.as_str());
+            let should_send_voice = if tts_cfg.inbound_only {
+                is_voice_chat
+            } else {
+                true
+            };
+
+            if should_send_voice {
+                if Self::is_substantive_for_tts(&content) {
+                    match super::tts::TtsManager::new(tts_cfg) {
+                        Ok(tts_manager) => {
+                            match tts_manager.synthesize(&content).await {
+                                Ok(audio_bytes) => {
+                                    let ext = &tts_cfg.default_format;
+                                    let file_name = format!("voice.{ext}");
+                                    match self
+                                        .send_voice_bytes(
+                                            chat_id,
+                                            thread_id,
+                                            audio_bytes,
+                                            &file_name,
+                                            None,
+                                        )
+                                        .await
+                                    {
+                                        Ok(()) => {
+                                            // Clear the voice-chat flag only after a
+                                            // successful send so that a transient
+                                            // network error doesn't silently swallow
+                                            // the inbound-mode state.
+                                            let mut vc = self.voice_chats.lock();
+                                            vc.remove(message.recipient.as_str());
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                "Telegram TTS voice reply failed: {e}"
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!("Telegram TTS synthesis failed: {e}");
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("Telegram TTS manager init failed: {e}");
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
@@ -4133,6 +4277,118 @@ mod tests {
         let ch =
             TelegramChannel::new("token".into(), vec!["*".into()], false).with_transcription(tc);
         assert!(ch.transcription.is_none());
+    }
+
+    #[test]
+    fn with_tts_sets_config_when_enabled() {
+        let mut tc = crate::config::TtsConfig::default();
+        tc.enabled = true;
+
+        let ch = TelegramChannel::new("token".into(), vec!["*".into()], false).with_tts(tc);
+        assert!(ch.tts_config.is_some());
+    }
+
+    #[test]
+    fn with_tts_skips_when_disabled() {
+        let tc = crate::config::TtsConfig::default(); // enabled = false
+        let ch = TelegramChannel::new("token".into(), vec!["*".into()], false).with_tts(tc);
+        assert!(ch.tts_config.is_none());
+    }
+
+    #[test]
+    fn voice_chats_starts_empty() {
+        let ch = TelegramChannel::new("token".into(), vec![], false);
+        assert!(ch.voice_chats.lock().is_empty());
+    }
+
+    #[test]
+    fn tts_inbound_only_defaults_to_true() {
+        let cfg = crate::config::TtsConfig::default();
+        assert!(cfg.inbound_only, "inbound_only must default to true");
+    }
+
+    #[test]
+    fn parse_update_message_clears_voice_chat_flag() {
+        let ch = TelegramChannel::new("token".into(), vec!["*".into()], false);
+
+        // Seed a voice-chat entry for chat 999
+        ch.voice_chats.lock().insert("999".to_string());
+
+        let update = serde_json::json!({
+            "message": {
+                "message_id": 1,
+                "text": "hello",
+                "from": { "id": 1, "username": "alice" },
+                "chat": { "id": 999, "type": "private" }
+            }
+        });
+
+        let parsed = ch.parse_update_message(&update);
+        assert!(parsed.is_some());
+        // The text message should have cleared the voice-chat flag
+        assert!(
+            !ch.voice_chats.lock().contains("999"),
+            "voice_chats must be cleared when a text message arrives"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_voice_bytes_returns_error_without_server() {
+        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false);
+        let audio_bytes = b"fake-audio-data".to_vec();
+
+        let result = ch
+            .send_voice_bytes("123456", None, audio_bytes, "voice.mp3", None)
+            .await;
+
+        // Should fail with network error, not a panic or type error
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("error") || err.contains("failed") || err.contains("connect"),
+            "Expected network error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn is_substantive_for_tts_passes_natural_language() {
+        let text = "This is a normal natural language reply that is long enough to pass the threshold.";
+        assert!(TelegramChannel::is_substantive_for_tts(text));
+    }
+
+    #[test]
+    fn is_substantive_for_tts_rejects_short_content() {
+        assert!(!TelegramChannel::is_substantive_for_tts("OK"));
+    }
+
+    #[test]
+    fn is_substantive_for_tts_rejects_url() {
+        let text = "https://example.com/some/really/long/url/path/that/exceeds/forty/characters";
+        assert!(!TelegramChannel::is_substantive_for_tts(text));
+    }
+
+    #[test]
+    fn is_substantive_for_tts_rejects_json() {
+        let text = r#"{"key": "value", "some": "other field that makes it long enough"}"#;
+        assert!(!TelegramChannel::is_substantive_for_tts(text));
+    }
+
+    #[test]
+    fn is_substantive_for_tts_rejects_code_block() {
+        let text = "Here is the code:\n```rust\nfn main() { println!(\"hello world\"); }\n```";
+        assert!(!TelegramChannel::is_substantive_for_tts(text));
+    }
+
+    #[test]
+    fn is_substantive_for_tts_rejects_error_message() {
+        let text = "Error: something went wrong while processing your very long request here";
+        assert!(!TelegramChannel::is_substantive_for_tts(text));
+    }
+
+    #[test]
+    fn is_substantive_for_tts_rejects_tool_call_content() {
+        let text = "tool_call: some action that is definitely long enough to pass length check";
+        assert!(!TelegramChannel::is_substantive_for_tts(text));
     }
 
     #[tokio::test]

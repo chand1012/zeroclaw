@@ -475,7 +475,13 @@ impl Channel for WhatsAppWebChannel {
             .map(|vs| vs.contains(&message.recipient))
             .unwrap_or(false);
 
-        if is_voice_chat && self.tts_config.is_some() {
+        let should_send_voice = self
+            .tts_config
+            .as_ref()
+            .map(|cfg| if cfg.inbound_only { is_voice_chat } else { true })
+            .unwrap_or(false);
+
+        if should_send_voice {
             let content = &message.content;
             // Only queue substantive natural-language replies for voice.
             // Skip tool outputs: URLs, JSON, code blocks, errors, short status.

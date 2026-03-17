@@ -846,6 +846,10 @@ fn default_tts_max_text_length() -> usize {
     4096
 }
 
+fn default_tts_inbound_only() -> bool {
+    true
+}
+
 fn default_openai_tts_model() -> String {
     "tts-1".into()
 }
@@ -892,6 +896,12 @@ pub struct TtsConfig {
     /// Maximum input text length in characters (default 4096).
     #[serde(default = "default_tts_max_text_length")]
     pub max_text_length: usize,
+    /// When `true` (default), only respond with a TTS audio file when the
+    /// user's incoming message was itself a voice/audio message ("inbound"
+    /// mode).  Set to `false` to always synthesise a spoken reply regardless
+    /// of how the user sent their message.
+    #[serde(default = "default_tts_inbound_only")]
+    pub inbound_only: bool,
     /// OpenAI TTS provider configuration (`[tts.openai]`).
     #[serde(default)]
     pub openai: Option<OpenAiTtsConfig>,
@@ -914,6 +924,7 @@ impl Default for TtsConfig {
             default_voice: default_tts_voice(),
             default_format: default_tts_format(),
             max_text_length: default_tts_max_text_length(),
+            inbound_only: default_tts_inbound_only(),
             openai: None,
             elevenlabs: None,
             google: None,
@@ -11719,5 +11730,29 @@ require_otp_to_resume = true
             debug_output.contains("[REDACTED]"),
             "Debug output must show [REDACTED] for client_secret"
         );
+    }
+
+    #[test]
+    async fn tts_config_inbound_only_defaults_to_true() {
+        let cfg = TtsConfig::default();
+        assert!(cfg.inbound_only, "inbound_only must default to true");
+    }
+
+    #[test]
+    async fn tts_config_inbound_only_deserialises_false() {
+        let toml = r#"
+            enabled = true
+            inbound_only = false
+        "#;
+        let cfg: TtsConfig = toml::from_str(toml).expect("valid TtsConfig TOML");
+        assert!(!cfg.inbound_only);
+    }
+
+    #[test]
+    async fn tts_config_inbound_only_omitted_defaults_true() {
+        // When the key is absent, inbound_only should fall back to true.
+        let toml = r#"enabled = true"#;
+        let cfg: TtsConfig = toml::from_str(toml).expect("valid TtsConfig TOML");
+        assert!(cfg.inbound_only);
     }
 }
