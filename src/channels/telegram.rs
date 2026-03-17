@@ -2607,11 +2607,11 @@ impl Channel for TelegramChannel {
 
         self.send_text_chunks(&content, chat_id, thread_id).await?;
 
-        // Inbound TTS mode: synthesise a voice reply when the user's last
-        // message was a voice note (inbound_only=true, the default) or always
-        // when inbound_only=false.  Only substantive natural-language replies
-        // are converted — tool outputs, URLs, JSON, code blocks, and error
-        // messages are skipped.
+        // Inbound TTS mode: synthesise a voice reply always (inbound_only=false,
+        // the default) or only when the user's last message was a voice note
+        // (inbound_only=true).  Only substantive natural-language replies are
+        // converted — tool outputs, URLs, JSON, code blocks, and error messages
+        // are skipped.
         if let Some(ref tts_cfg) = self.tts_config {
             let is_voice_chat = self.voice_chats.lock().contains(message.recipient.as_str());
             let should_send_voice = if tts_cfg.inbound_only {
@@ -4302,9 +4302,9 @@ mod tests {
     }
 
     #[test]
-    fn tts_inbound_only_defaults_to_true() {
+    fn tts_inbound_only_defaults_to_false() {
         let cfg = crate::config::TtsConfig::default();
-        assert!(cfg.inbound_only, "inbound_only must default to true");
+        assert!(!cfg.inbound_only, "inbound_only must default to false");
     }
 
     #[test]
