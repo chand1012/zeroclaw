@@ -934,6 +934,12 @@ pub struct OpenAiTtsConfig {
     /// Playback speed multiplier (default `1.0`).
     #[serde(default = "default_openai_tts_speed")]
     pub speed: f64,
+    /// Optional base URL override for an OpenAI-compatible TTS endpoint
+    /// (e.g. `"https://openai-compat.example.com"`).  Defaults to
+    /// `https://api.openai.com` when not set.  The environment variable
+    /// `OPENAI_TTS_API_URL` is also checked as a fallback before the default.
+    #[serde(default)]
+    pub api_url: Option<String>,
 }
 
 /// ElevenLabs TTS provider configuration.

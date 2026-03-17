@@ -41,11 +41,14 @@ pub struct OpenAiTtsProvider {
     model: String,
     speed: f64,
     client: reqwest::Client,
+    api_base: String,
 }
 
 impl OpenAiTtsProvider {
     /// Create a new OpenAI TTS provider from config, resolving the API key
-    /// from config or `OPENAI_API_KEY` env var.
+    /// from config or `OPENAI_API_KEY` env var.  The base URL is resolved from
+    /// `[tts.openai].api_url` → `OPENAI_TTS_API_URL` env var →
+    /// `https://api.openai.com` (default).
     pub fn new(config: &crate::config::OpenAiTtsConfig) -> Result<Self> {
         let api_key = config
             .api_key
@@ -61,6 +64,20 @@ impl OpenAiTtsProvider {
             })
             .context("Missing OpenAI TTS API key: set [tts.openai].api_key or OPENAI_API_KEY")?;
 
+        let api_base = config
+            .api_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+            .map(ToOwned::to_owned)
+            .or_else(|| {
+                std::env::var("OPENAI_TTS_API_URL")
+                    .ok()
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty())
+            })
+            .unwrap_or_else(|| "https://api.openai.com".to_string());
+
         Ok(Self {
             api_key,
             model: config.model.clone(),
@@ -69,6 +86,7 @@ impl OpenAiTtsProvider {
                 .timeout(TTS_HTTP_TIMEOUT)
                 .build()
                 .context("Failed to build HTTP client for OpenAI TTS")?,
+            api_base,
         })
     }
 }
@@ -90,7 +108,10 @@ impl TtsProvider for OpenAiTtsProvider {
 
         let resp = self
             .client
-            .post("https://api.openai.com/v1/audio/speech")
+            .post(format!(
+                "{}/v1/audio/speech",
+                self.api_base.trim_end_matches('/')
+            ))
             .bearer_auth(&self.api_key)
             .json(&body)
             .send()
@@ -574,6 +595,10 @@ impl TtsManager {
 mod tests {
     use super::*;
 
+    /// Mutex that serializes all tests that read/write environment variables, so
+    /// parallel test threads don't observe each other's mutations.
+    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn default_tts_config() -> TtsConfig {
         TtsConfig::default()
     }
@@ -672,5 +697,73 @@ mod tests {
         config.max_text_length = 0;
         let manager = TtsManager::new(&config).unwrap();
         assert_eq!(manager.max_text_length, DEFAULT_MAX_TEXT_LENGTH);
+    }
+
+    #[test]
+    fn openai_tts_provider_default_api_base() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        // SAFETY: `ENV_MUTEX` serializes all env-var mutations in this module,
+        // so no other test thread reads or writes this variable concurrently.
+        unsafe { std::env::remove_var("OPENAI_TTS_API_URL") };
+        let config = crate::config::OpenAiTtsConfig {
+            api_key: Some("test-key".to_string()),
+            model: "tts-1".to_string(),
+            speed: 1.0,
+            api_url: None,
+        };
+        let provider = OpenAiTtsProvider::new(&config).unwrap();
+        assert_eq!(provider.api_base, "https://api.openai.com");
+    }
+
+    #[test]
+    fn openai_tts_provider_custom_api_url() {
+        let config = crate::config::OpenAiTtsConfig {
+            api_key: Some("test-key".to_string()),
+            model: "tts-1".to_string(),
+            speed: 1.0,
+            api_url: Some("https://openai-compat.example.com".to_string()),
+        };
+        let provider = OpenAiTtsProvider::new(&config).unwrap();
+        assert_eq!(provider.api_base, "https://openai-compat.example.com");
+    }
+
+    #[test]
+    fn openai_tts_provider_env_api_url_fallback() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        // SAFETY: `ENV_MUTEX` serializes all env-var mutations in this module,
+        // so no other test thread reads or writes this variable concurrently.
+        let env_url = "https://env-compat.example.com";
+        unsafe { std::env::set_var("OPENAI_TTS_API_URL", env_url) };
+        let config = crate::config::OpenAiTtsConfig {
+            api_key: Some("test-key".to_string()),
+            model: "tts-1".to_string(),
+            speed: 1.0,
+            api_url: None,
+        };
+        let provider = OpenAiTtsProvider::new(&config).unwrap();
+        unsafe { std::env::remove_var("OPENAI_TTS_API_URL") };
+        assert_eq!(provider.api_base, env_url);
+    }
+
+    #[test]
+    fn openai_tts_provider_config_url_takes_precedence_over_env() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        // SAFETY: `ENV_MUTEX` serializes all env-var mutations in this module,
+        // so no other test thread reads or writes this variable concurrently.
+        unsafe {
+            std::env::set_var(
+                "OPENAI_TTS_API_URL",
+                "https://env-should-be-ignored.example.com",
+            );
+        };
+        let config = crate::config::OpenAiTtsConfig {
+            api_key: Some("test-key".to_string()),
+            model: "tts-1".to_string(),
+            speed: 1.0,
+            api_url: Some("https://config-wins.example.com".to_string()),
+        };
+        let provider = OpenAiTtsProvider::new(&config).unwrap();
+        unsafe { std::env::remove_var("OPENAI_TTS_API_URL") };
+        assert_eq!(provider.api_base, "https://config-wins.example.com");
     }
 }
